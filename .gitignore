@@ -1,0 +1,38 @@
+# Keil / STM32
+*.uvguix.*
+*.uvoptx
+RTE/
+Objects/
+Listings/
+*.o
+*.obj
+*.axf
+*.elf
+*.map
+*.lnp
+*.dep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# YOLO / ML
+runs/
+dataset/
+*.pt
+
+# Archives
+*.7z
+*.zip
+*.rar
+
+# OS
+.DS_Store
+Thumbs.db
