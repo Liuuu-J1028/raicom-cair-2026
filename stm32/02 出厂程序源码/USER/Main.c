@@ -627,58 +627,276 @@ void Loop_PS2_Motors(void) {
 void Loop_ColorSorting(void){
     Color_Sorting();
 }
+/*============================================================
+ *  视觉自主模式 —— 非阻塞抓取状态机
+ *  每步用 millis() 计时，不卡主循环，看门狗安全
+ *  SELECT+START 可随时中断回到遥控模式
+ *
+ *  ⚠️ 所有舵机角度均为占位值，联调时根据实物逐一标定
+ *============================================================*/
+
+/* ---- 时序参数 (ms) —— 拿到车后按实测微调 ---- */
+#define VA_FORWARD_MS      1200    // 前进到物块前
+#define VA_ARM_UNFOLD_MS   1000    // 机械臂展开
+#define VA_CLAW_OPEN_MS     400    // 夹爪张开
+#define VA_ARM_DESCEND_MS   800    // 手臂下降
+#define VA_CLAW_CLOSE_MS    500    // 夹爪闭合抓取
+#define VA_ARM_LIFT_MS      800    // 手臂抬起
+#define VA_BACKWARD_MS      800    // 后退
+#define VA_TURN_MS          600    // 90°转向
+#define VA_TO_ZONE_MS      1500    // 前进到配送区
+#define VA_RELEASE_MS       500    // 释放物块
+#define VA_ARM_RESET_MS    1000    // 手臂复位
+
+/* ---- 电机速度 (-1000~1000) ---- */
+#define VA_SPEED_FWD        600
+#define VA_SPEED_BACK      -600
+
+/* ---- 舵机指令串 (PWM 500~2500, 1500=中位) ---- */
+/* 蜷缩复位（比赛开始/结束姿态） */
+#define VA_CURL_CMD  "#000P1500T1000!#001P2100T1000!#002P2300T1000!#003P1000T1000!#004P1500T1000!#005P1500T1000!"
+/* 展开手臂准备抓取 */
+#define VA_UNFOLD_CMD "#000P1500T1000!#001P1700T1000!#002P1700T1000!#003P1300T1000!#004P1500T1000!#005P2100T1000!"
+/* 手臂下降到物块高度 */
+#define VA_DESCEND_CMD "#001P2000T0800!#002P2000T0800!#003P1500T0800!"
+/* 夹爪闭合抓取 */
+#define VA_GRAB_CMD    "#005P0900T0500!"
+/* 抬起物块 */
+#define VA_LIFT_CMD    "#001P1600T0800!#002P1800T0800!"
+/* 底座转向配送区1（齿轮/左） */
+#define VA_TURN_Z1_CMD "#000P0900T0600!"
+/* 底座转向配送区2（螺母/右） */
+#define VA_TURN_Z2_CMD "#000P2100T0600!"
+/* 夹爪张开释放 */
+#define VA_RELEASE_CMD "#005P2100T0500!"
+
+/* ---- 抓取状态枚举 ---- */
+#define VA_ST_IDLE          0
+#define VA_ST_FORWARD       1
+#define VA_ST_UNFOLD        2
+#define VA_ST_OPEN_CLAW     3
+#define VA_ST_DESCEND       4
+#define VA_ST_GRAB          5
+#define VA_ST_LIFT          6
+#define VA_ST_BACKWARD      7
+#define VA_ST_TURN          8
+#define VA_ST_TO_ZONE       9
+#define VA_ST_RELEASE      10
+#define VA_ST_BACKWARD_2   11
+#define VA_ST_TURN_BACK    12
+#define VA_ST_RESET        13
+#define VA_ST_DONE         14
+
 /*************************************************************
 函数名称：Loop_Vision_Auto()
-功能介绍：视觉自主模式处理 —— 完全独立，只处理ESP32视觉指令
+功能介绍：视觉自主模式 —— 非阻塞抓取状态机
+          收到ESP32指令(0x01=齿轮/0x02=螺母)后，
+          自动完成：前进→抓取→后退→转向→配送→释放→复位
 函数参数：无
 返回值：  无
 *************************************************************/
 void Loop_Vision_Auto(void) {
 	static u32 systick_ms_bak = 0;
+	static u8  state      = VA_ST_IDLE;
+	static u8  cmd_type   = 0;
+	static u8  round      = 0;
+	static u32 state_tmr  = 0;
 
-	// 每50ms轮询一次PS2，仅检测 SELECT+START 组合键切回遥控模式
+	/* ---- 每50ms检测 SELECT+START 切回遥控 ---- */
 	if(millis() - systick_ms_bak >= 50) {
 		systick_ms_bak = millis();
 		psx_write_read(PS2_Buf);
 
-		// SELECT + START 同时按下 → 切回遥控模式
 		if(PS2_SELECT && PS2_START) {
-			delay_ms(100);  // 消抖
+			delay_ms(100);
 			psx_write_read(PS2_Buf);
 			if(PS2_SELECT && PS2_START) {
 				Sys_Mode = SYS_MODE_REMOTE;
 				Auto_Mode = 0;
 				Motors_Run(0,0,0,0);
-				Beep_On_times(2, 100);  // 响两声表示切回遥控
+				state    = VA_ST_IDLE;
+				cmd_type = 0;
+				Beep_On_times(2, 100);
 				while(PS2_SELECT || PS2_START) {
 					psx_write_read(PS2_Buf);
 				}
+				return;
 			}
 		}
 	}
 
-	// 处理ESP32视觉指令
-	if(rx_cmd != 0) {
-		u8 cmd = rx_cmd;
-		rx_cmd = 0;  // 立即清零，防止重复执行
+	/* ======== 抓取状态机 ======== */
+	switch(state) {
 
-		switch(cmd) {
-			case 0x01:  // 识别到齿轮
-				Beep_On_times(1, 50);
-				// TODO: 填入抓取齿轮的动作序列
-				// 示例：机械臂移动到齿轮位置 → 夹取 → 收回
-				// Bususart_Send_Str((u8 *)"#000P1500T1000!#001P2000T1000!...");
-				break;
+		/*----- IDLE：等待 ESP32 指令 -----*/
+		case VA_ST_IDLE:
+			if(rx_cmd != 0) {
+				cmd_type = rx_cmd;
+				rx_cmd  = 0;
+				if(cmd_type == 0x01)
+					Beep_On_times(1, 50);   // 齿轮→响1声
+				else if(cmd_type == 0x02)
+					Beep_On_times(2, 50);   // 螺母→响2声
+				else return;
 
-			case 0x02:  // 识别到螺母
-				Beep_On_times(2, 50);
-				// TODO: 填入抓取螺母的动作序列
-				// Bususart_Send_Str((u8 *)"#000P1500T1000!#001P2000T1000!...");
-				break;
+				state     = VA_ST_FORWARD;
+				state_tmr = millis();
+				Motors_Run(VA_SPEED_FWD, VA_SPEED_FWD,
+				           VA_SPEED_FWD, VA_SPEED_FWD);
+			}
+			break;
 
-			default:
-				break;
-		}
+		/*----- ① 前进到物块前 -----*/
+		case VA_ST_FORWARD:
+			if(millis() - state_tmr >= VA_FORWARD_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_UNFOLD;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_UNFOLD_CMD);
+			}
+			break;
+
+		/*----- ② 机械臂展开 -----*/
+		case VA_ST_UNFOLD:
+			if(millis() - state_tmr >= VA_ARM_UNFOLD_MS) {
+				state     = VA_ST_OPEN_CLAW;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_RELEASE_CMD);
+			}
+			break;
+
+		/*----- ③ 夹爪张开 -----*/
+		case VA_ST_OPEN_CLAW:
+			if(millis() - state_tmr >= VA_CLAW_OPEN_MS) {
+				state     = VA_ST_DESCEND;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_DESCEND_CMD);
+			}
+			break;
+
+		/*----- ④ 手臂下降到物块 -----*/
+		case VA_ST_DESCEND:
+			if(millis() - state_tmr >= VA_ARM_DESCEND_MS) {
+				state     = VA_ST_GRAB;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_GRAB_CMD);
+			}
+			break;
+
+		/*----- ⑤ 夹爪闭合抓取 -----*/
+		case VA_ST_GRAB:
+			if(millis() - state_tmr >= VA_CLAW_CLOSE_MS) {
+				state     = VA_ST_LIFT;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_LIFT_CMD);
+			}
+			break;
+
+		/*----- ⑥ 抬起物块 -----*/
+		case VA_ST_LIFT:
+			if(millis() - state_tmr >= VA_ARM_LIFT_MS) {
+				state     = VA_ST_BACKWARD;
+				state_tmr = millis();
+				Motors_Run(VA_SPEED_BACK, VA_SPEED_BACK,
+				           VA_SPEED_BACK, VA_SPEED_BACK);
+			}
+			break;
+
+		/*----- ⑦ 后退离开 -----*/
+		case VA_ST_BACKWARD:
+			if(millis() - state_tmr >= VA_BACKWARD_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_TURN;
+				state_tmr = millis();
+				if(cmd_type == 0x01)
+					Motors_Run(-500, 500, -500, 500);  // 齿轮→左转
+				else
+					Motors_Run(500, -500, 500, -500);  // 螺母→右转
+			}
+			break;
+
+		/*----- ⑧ 转向配送区 -----*/
+		case VA_ST_TURN:
+			if(millis() - state_tmr >= VA_TURN_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_TO_ZONE;
+				state_tmr = millis();
+				Motors_Run(VA_SPEED_FWD, VA_SPEED_FWD,
+				           VA_SPEED_FWD, VA_SPEED_FWD);
+				if(cmd_type == 0x01)
+					Bususart_Send_Str((u8 *)VA_TURN_Z1_CMD);
+				else
+					Bususart_Send_Str((u8 *)VA_TURN_Z2_CMD);
+			}
+			break;
+
+		/*----- ⑨ 前进到配送区 -----*/
+		case VA_ST_TO_ZONE:
+			if(millis() - state_tmr >= VA_TO_ZONE_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_RELEASE;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_RELEASE_CMD);
+			}
+			break;
+
+		/*----- ⑩ 释放物块 -----*/
+		case VA_ST_RELEASE:
+			if(millis() - state_tmr >= VA_RELEASE_MS) {
+				state     = VA_ST_BACKWARD_2;
+				state_tmr = millis();
+				Motors_Run(VA_SPEED_BACK, VA_SPEED_BACK,
+				           VA_SPEED_BACK, VA_SPEED_BACK);
+			}
+			break;
+
+		/*----- ⑪ 后退离开配送区 -----*/
+		case VA_ST_BACKWARD_2:
+			if(millis() - state_tmr >= VA_BACKWARD_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_TURN_BACK;
+				state_tmr = millis();
+				if(cmd_type == 0x01)
+					Motors_Run(500, -500, 500, -500);   // 右转回
+				else
+					Motors_Run(-500, 500, -500, 500);   // 左转回
+			}
+			break;
+
+		/*----- ⑫ 转回中继区方向 -----*/
+		case VA_ST_TURN_BACK:
+			if(millis() - state_tmr >= VA_TURN_MS) {
+				Motors_Run(0,0,0,0);
+				state     = VA_ST_RESET;
+				state_tmr = millis();
+				Bususart_Send_Str((u8 *)VA_CURL_CMD);
+			}
+			break;
+
+		/*----- ⑬ 手臂复位蜷缩 -----*/
+		case VA_ST_RESET:
+			if(millis() - state_tmr >= VA_ARM_RESET_MS) {
+				state     = VA_ST_DONE;
+				state_tmr = millis();
+			}
+			break;
+
+		/*----- ⑭ 本轮完成，检查是否满8轮 -----*/
+		case VA_ST_DONE:
+			round++;
+			if(round >= 8) {
+				Beep_On_times(3, 200);   // 全部完成→响3声
+				state = VA_ST_IDLE;
+				round = 0;
+			} else {
+				state = VA_ST_IDLE;      // 回IDLE等下一轮
+			}
+			cmd_type = 0;
+			break;
+
+		default:
+			state = VA_ST_IDLE;
+			break;
 	}
 }
 
