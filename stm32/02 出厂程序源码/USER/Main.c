@@ -68,6 +68,11 @@
 
 /*全局变量定义*/
 u8 PS2_Buf[9]={0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};   //存储手柄的数据
+
+/* PS2 手柄按键快速检测宏（PS2协议：按下时对应位为0） */
+#define PS2_SELECT  ((PS2_Buf[3] & 0x01) == 0)   // SELECT 对应 PS2_Buf[3] bit0
+#define PS2_START   ((PS2_Buf[3] & 0x08) == 0)   // START  对应 PS2_Buf[3] bit3
+
 u8 Voice_Flag = 0;  //用于控制语音识别时小车的基本动作执行时间为2秒
 u8 Auto_Mode = 0;   //定义模式参数
 #define SYS_MODE_REMOTE  0
@@ -708,7 +713,7 @@ void Loop_Vision_Auto(void) {
 		psx_write_read(PS2_Buf);
 
 		if(PS2_SELECT && PS2_START) {
-			delay_ms(100);
+			Delay_ms(100);
 			psx_write_read(PS2_Buf);
 			if(PS2_SELECT && PS2_START) {
 				Sys_Mode = SYS_MODE_REMOTE;
