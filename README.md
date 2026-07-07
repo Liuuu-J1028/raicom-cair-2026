@@ -32,18 +32,21 @@
 
 ```
 raicom-cair-2026/
-├── vision/            # ESP32 视觉识别
-│   ├── dataset/       # 训练数据集（螺丝/螺母照片）
-│   ├── model/         # YOLO 模型
-│   └── deploy/        # ESP32 推理部署
-├── control/           # STM32 底层控制
-│   ├── walker.c       # 行走控制（电机 PWM + 方向）
-│   ├── walker.h       # 行走模块配置
-│   ├── servo/         # 舵机臂 + 夹爪
-│   ├── sensor/        # 超声波 + 红外
-│   └── protocol/      # 串口通信协议
-├── docs/              # 比赛文档、场地示意图
-└── README.md          # 本文件
+├── stm32/                    # STM32 底层控制（Keil 工程）
+│   └── 02 出厂程序源码/
+│       ├── USER/Main.c       # 主循环 + 抓取状态机
+│       ├── Hardware/Usart.c  # 串口 + ESP32 通信
+│       ├── Hardware/Action.c # 舵机/动作组控制
+│       └── Project/          # Keil 工程文件 (.uvprojx)
+├── vision/                   # ESP32 视觉识别
+│   ├── esp32_stm32_direct/   # ★ ESP32 直连方案（当前使用）
+│   ├── esp32_test_sender/    # 测试发送器（调试用）
+│   ├── esp32_cam/            # [废弃] PC 中转架构
+│   └── esp32_arduino/        # [废弃] PC 辅助调试
+├── docs/                     # 协议文档、进度日志
+│   └── protocol.md           # 通信协议说明
+├── control/platformio/       # [废弃] 旧 Arduino 代码
+└── README.md
 ```
 
 ---
@@ -78,14 +81,6 @@ cd raicom-cair-2026
 ---
 
 > 🚗 **致自己：** 大一零基础开局，一个月从无到有。不论结果如何，冲！
-
----
-
-> ⚠️ **协议对齐声明 (2026-07-04)**
->
-> 本仓库已统一通信架构为 **方案一：ESP32 直连 STM32**（无 PC 参与）。
-> 旧代码（、 等 PC 中转方案）已废弃。
-> 详见 。
 
 ---
 
